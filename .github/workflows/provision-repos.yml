@@ -1,0 +1,133 @@
+name: Provision GitHub Repos from CSV
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'requests/**/*.csv'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_OWNER: ${{ vars.MY_GITHUB_OWNER}}     # <-- set this to your real org
+      GH_TOKEN: ${{ secrets.ADMIN_PAT }} # classic PAT with repo + admin:org; SSO-enabled
+      GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+
+    steps:
+      - name: Checkout (full history so diffs work)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show workspace and list CSVs
+        run: |
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "All CSVs under requests/:"
+          find requests -type f -name '*.csv' -print || true
+
+      - name: Detect changed CSVs (fallback to all if none)
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+      
+          # Find changed CSVs
+          CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" -- 'requests/**/*.csv' || true)
+      
+          # Fallback to all CSVs if none detected (first run / squash merge / etc.)
+          if [ -z "$CHANGED" ]; then
+            echo "No changed CSVs detected; falling back to all CSVs under requests/."
+            CHANGED=$(find requests -type f -name '*.csv' -print | sort || true)
+          fi
+      
+          if [ -z "$CHANGED" ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+      
+          echo "Will process these CSVs:"
+          echo "$CHANGED"
+      
+          # Write outputs:
+          #  - count: single line
+          #  - files: newline-delimited list (multiline output)
+          COUNT=$(printf "%s\n" $CHANGED | wc -l | tr -d ' ')
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<EOF"
+            printf "%s\n" $CHANGED
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stop if nothing to do
+        if: steps.detect.outputs.count == '0'
+        run: echo "No CSVs found to process."
+
+      - name: Quick peek at first CSV (sanity)
+        if: steps.detect.outputs.count != '0'
+        shell: bash
+        run: |
+          FIRST=$(printf "%s\n" "${{ steps.detect.outputs.files }}" | head -n1)
+          echo "First CSV: $FIRST"
+          echo "--- head $FIRST ---"
+          head -n 5 "$FIRST" || true
+          echo "--------------------"
+
+
+      - name: Setup Terraform
+        if: steps.detect.outputs.count != '0'
+        uses: hashicorp/setup-terraform@v3
+
+      - name: gh auth status (uses GH_TOKEN env)
+        if: steps.detect.outputs.count != '0'
+        run: gh auth status
+
+      - name: Terraform init
+        if: steps.detect.outputs.count != '0'
+        working-directory: terraform
+        run: terraform init
+
+      - name: Create repos from each CSV
+        if: steps.detect.outputs.count != '0'
+        shell: bash
+        working-directory: terraform
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GITHUB_OWNER: ${{ vars.MY_GITHUB_OWNER}}
+        run: |
+          set -euo pipefail
+      
+          # Read multiline output into an array, preserving spaces
+          mapfile -t CSV_LIST < <(printf "%s\n" "${{ steps.detect.outputs.files }}")
+      
+          for CSV in "${CSV_LIST[@]}"; do
+            # Ignore blank lines
+            [ -z "$CSV" ] && continue
+      
+            ABS_CSV="$(realpath "$GITHUB_WORKSPACE/$CSV")"
+            echo
+            echo "==== Processing $ABS_CSV ===="
+            test -f "$ABS_CSV" || { echo "CSV not found: $ABS_CSV"; exit 1; }
+      
+            terraform apply -auto-approve \
+              -var "github_owner=$GITHUB_OWNER" \
+              -var "repos_csv_path=$ABS_CSV"
+          done
+
+      - name: Show Terraform csv_used output (last apply)
+        if: steps.detect.outputs.count != '0'
+        working-directory: terraform
+        run: terraform output csv_used || true
+
+      - name: Clean terraform artifacts (stateless runs)
+        if: always()
+        working-directory: terraform
+        run: |
+          rm -f terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl || true
+          rm -rf .terraform || true
