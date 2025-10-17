@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_OWNER: ${{ vars.MY_GITHUB_OWNER}}     # <-- set this to your real org
-      GH_TOKEN: ${{ secrets.ADMIN_PAT }} # classic PAT with repo + admin:org; SSO-enabled
-      GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+      GH_TOKEN: ${{ secrets.ADMIN_PAT1 }} # classic PAT with repo + admin:org; SSO-enabled
+      GITHUB_TOKEN: ${{ secrets.ADMIN_PAT1 }}
 
     steps:
       - name: Checkout (full history so diffs work)
@@ -97,8 +97,8 @@ jobs:
         shell: bash
         working-directory: terraform
         env:
-          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
-          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT }}
+          GH_TOKEN: ${{ secrets.ADMIN_PAT1 }}
+          GITHUB_TOKEN: ${{ secrets.ADMIN_PAT1 }}
           GITHUB_OWNER: ${{ vars.MY_GITHUB_OWNER}}
         run: |
           set -euo pipefail
