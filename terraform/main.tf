@@ -14,7 +14,7 @@ locals {
     lower(r["name"]) => {
       name        = r["name"]
       description = try(r["description"], "")
-      visibility  = lower(try(r["visibility"], "private"))  # private|public|internal (internal = Enterprise Cloud)
+      visibility  = lower(try(r["visibility"], "public"))  # private|public|internal (internal = Enterprise Cloud)
     }
     if contains(keys(r), "name") && length(trimspace(try(r["name"], ""))) > 0
   }
