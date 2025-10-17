@@ -8,7 +8,7 @@ jobs:
     # Set GH_TOKEN for all steps in this job
     env:
       # Prefer an org secret with repo + admin:org. Fallback to the workflow token if not set.
-      GH_TOKEN: ${{ secrets.ADMIN_PAT != '' && secrets.ADMIN_PAT || github.token }}
+      GH_TOKEN: ${{ secrets.ADMIN_PAT1 != '' && secrets.ADMIN_PAT1 || github.token }}
     steps:
       - uses: actions/checkout@v4
 
