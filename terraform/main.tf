@@ -100,15 +100,6 @@ if [ -n "$CODEOWNERS_CONTENT" ]; then
     -f message="chore: add CODEOWNERS ($timestamp)" \
     -f content="$B64" || echo "CODEOWNERS already present or write-protected; skipping."
 fi
-
-# Inject Snyk workflow (optional)
-if [ "$INJECT_SNYK" = "true" ]; then
-  WF_B64=$(printf "%s" "$SNYK_WORKFLOW_YAML" | base64 -w0 || base64)
-  gh api -X PUT "repos/$OWNER/$NAME/contents/.github/workflows/snyk.yml" \
-    -f message="ci: add Snyk workflow ($timestamp)" \
-    -f content="$WF_B64" || echo "snyk.yml already present or write-protected; skipping."
-fi
-
 echo "Post-create hardening complete for $OWNER/$NAME"
 EOT
   }
