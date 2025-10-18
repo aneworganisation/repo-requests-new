@@ -15,7 +15,7 @@ locals {
     lower(r["name"]) => {
       name        = r["name"]
       description = try(r["description"], "")
-      visibility  = lower(try(r["visibility"], "private"))  # private|public|internal
+      visibility  = lower(try(r["visibility"], "public"))  # private|public|internal
     }
     if contains(keys(r), "name") && length(trimspace(try(r["name"], ""))) > 0
   }
@@ -93,7 +93,7 @@ EOT
     command = <<EOT
 set -euo pipefail
 
-# 2.1 Determine default branch; initialize if repo is empty
+# 2.1 Determine default branch via gh (gh has built-in --jq; no jq binary needed)
 DEF="$(gh repo view "$OWNER/$NAME" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
 if [ -z "$DEF" ] || [ "$DEF" = "null" ]; then
   DEF="$DEFAULT_BRANCH_FALLBACK"
@@ -108,45 +108,49 @@ else
   echo "Default branch for $OWNER/$NAME is '$DEF'"
 fi
 
-# 2.2 Build required status checks array from comma list (allow empty -> [])
-CTX_JSON=$(printf "%s" "$REQUIRED_CONTEXTS_CSV" | jq -R '
-  split(",")
-  | map(gsub("^\\s+|\\s+$";""))
-  | map(select(length>0))
-')
+# 2.2 Build JSON array of required contexts WITHOUT jq (allow empty -> [])
+# REQUIRED_CONTEXTS_CSV is a comma-separated list (possibly empty).
+CTX_LIST=""
+if [ -n "$REQUIRED_CONTEXTS_CSV" ]; then
+  # Trim, split on comma, quote each, join with commas
+  CTX_LIST=$(printf "%s" "$REQUIRED_CONTEXTS_CSV" | awk -F',' '{
+    n=0;
+    for(i=1;i<=NF;i++){
+      gsub(/^[ \t]+|[ \t]+$/, "", $i);
+      if($i!=""){ if(n++) printf(","); printf("\"%s\"",$i) }
+    }
+  }')
+fi
+[ -z "$CTX_LIST" ] && CTX_LIST=""
 
 # 2.3 Convert inputs to proper JSON types (POSIX-safe defaults)
 RCO=false
 [ "$REQUIRE_CODEOWNER" = "true" ] && RCO=true
 
 APPROVALS="$REQUIRED_APPROVALS"
-if [ -z "$APPROVALS" ]; then APPPROVALS=2; fi
+if [ -z "$APPROVALS" ]; then APPROVALS=2; fi
 case "$APPROVALS" in ''|*[!0-9]*) APPROVALS=2 ;; esac
 
-# 2.4 Construct full JSON payload for branch protection
-PAYLOAD=$(jq -n \
-  --argjson contexts "$CTX_JSON" \
-  --argjson strict true \
-  --argjson admins true \
-  --argjson dismiss true \
-  --argjson codeowners "$RCO" \
-  --argjson approvals "$APPROVALS" \
-  '{
-     required_status_checks: {
-       strict: $strict,
-       contexts: $contexts
-     },
-     enforce_admins: $admins,
-     required_pull_request_reviews: {
-       dismiss_stale_reviews: $dismiss,
-       require_code_owner_reviews: $codeowners,
-       required_approving_review_count: $approvals
-     },
-     restrictions: null
-   }')
+# 2.4 Construct full JSON payload for branch protection (no jq)
+PAYLOAD=$(cat <<JSON
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [${CTX_LIST}]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": ${RCO},
+    "required_approving_review_count": ${APPROVALS}
+  },
+  "restrictions": null
+}
+JSON
+)
 
 echo "Applying branch protection on $OWNER/$NAME:$DEF with payload:"
-echo "$PAYLOAD" | jq .
+echo "$PAYLOAD"
 
 gh api -X PUT "repos/$OWNER/$NAME/branches/$DEF/protection" \
   -H "Accept: application/vnd.github+json" \
@@ -154,7 +158,7 @@ gh api -X PUT "repos/$OWNER/$NAME/branches/$DEF/protection" \
 
 echo "Branch protection applied."
 
-# 2.5 (Optional) Inject CODEOWNERS if content provided
+# 2.5 (Optional) Inject CODEOWNERS if content provided (no jq)
 if [ -n "$CODEOWNERS_CONTENT" ]; then
   ts="$(date +%s)"
   B64=$(printf "%s" "$CODEOWNERS_CONTENT" | base64 -w0 2>/dev/null || printf "%s" "$CODEOWNERS_CONTENT" | base64)
