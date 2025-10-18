@@ -43,7 +43,7 @@ resource "null_resource" "create_repo" {
       RAW_VIS = each.value.visibility
       DESC    = each.value.description
     }
-    command = <<'EOT'
+    command = <<EOT
 set -euo pipefail
 
 # Normalize visibility (fix common typo: "pubic" -> "public")
@@ -90,7 +90,7 @@ EOT
       REQUIRED_CONTEXTS_CSV   = join(",", var.required_contexts)  # comma-delimited for POSIX loop
       CODEOWNERS_CONTENT      = var.codeowners_content
     }
-    command = <<'EOT'
+    command = <<EOT
 set -euo pipefail
 
 # 2.1 Determine default branch; initialize if repo is empty
