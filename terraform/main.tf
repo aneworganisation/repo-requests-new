@@ -14,7 +14,7 @@ locals {
     lower(r["name"]) => {
       name        = r["name"]
       description = try(r["description"], "")
-      visibility  = lower(try(r["visibility"], "public"))  # private|public|internal
+      visibility  = lower(try(r["visibility"], "private"))  # private|public|internal
     }
     if contains(keys(r), "name") && length(trimspace(try(r["name"], ""))) > 0
   }
@@ -71,7 +71,7 @@ fi
 EOT
   }
 
-  # Step 2: Initialize default branch if needed, apply protection, inject files
+  # Step 2: Init default branch if needed, apply protection, inject files
   provisioner "local-exec" {
     when        = create
     interpreter = ["/bin/bash", "-c"]
@@ -81,23 +81,23 @@ EOT
       DEFAULT_BRANCH_FALLBACK = var.default_branch_fallback
       REQUIRED_APPROVALS      = tostring(var.required_approvals)
       REQUIRE_CODEOWNERS      = tostring(var.require_codeowner_review)
-      REQUIRED_CONTEXTS       = join(",", var.required_contexts) # comma-separated for POSIX loop
+      REQUIRED_CONTEXTS       = join(",", var.required_contexts) # comma-delimited for POSIX loop
       CODEOWNERS_CONTENT      = var.codeowners_content
     }
     command = <<EOT
 set -euo pipefail
 
-# Find default branch (may be null for empty repos)
+# Determine default branch; initialize if empty repo
 DEF="$(gh repo view "$OWNER/$NAME" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
 if [ -z "$DEF" ] || [ "$DEF" = "null" ]; then
   DEF="$DEFAULT_BRANCH_FALLBACK"
   echo "No default branch detected. Initializing '$DEF' with README.md…"
   B64=$(printf "%s\n" "# $NAME" | base64 -w0 2>/dev/null || printf "%s\n" "# $NAME" | base64)
   gh api -X PUT "repos/$OWNER/$NAME/contents/README.md" \
-    -f message="chore: init repo with README" \
-    -f content="$B64" \
-    -f branch="$DEF"
-  gh api -X PATCH "repos/$OWNER/$NAME" -f default_branch="$DEF"
+    -F message="chore: init repo with README" \
+    -F content="$B64" \
+    -F branch="$DEF"
+  gh api -X PATCH "repos/$OWNER/$NAME" -F default_branch="$DEF"
 else
   echo "Default branch for $OWNER/$NAME is '$DEF'"
 fi
@@ -111,16 +111,26 @@ for c in $REQUIRED_CONTEXTS; do
 done
 IFS="$OLDIFS"
 
-# Apply branch protection
+# Convert inputs to proper JSON literals ( POSIX-safe)
+RCO=false
+[ "$REQUIRE_CODEOWNERS" = "true" ] && RCO=true
+
+APPROVALS="$REQUIRED_APPROVALS"
+if [ -z "$APPROVALS" ]; then
+  APPROVALS=2
+fi
+case "$APPROVALS" in ''|*[!0-9]*) APPROVALS=2 ;; esac
+
+# Apply branch protection (use := for booleans/ints/null so JSON types are correct)
 # shellcheck disable=SC2086
 gh api -X PUT "repos/$OWNER/$NAME/branches/$DEF/protection" \
-  -f required_status_checks.strict=true \
+  -F required_status_checks.strict:=true \
   $CTX_ARGS \
-  -f enforce_admins=true \
-  -f required_pull_request_reviews.dismiss_stale_reviews=true \
-  -f required_pull_request_reviews.required_approving_review_count="$REQUIRED_APPROVALS" \
-  -f required_pull_request_reviews.require_code_owner_reviews="$REQUIRE_CODEOWNERS" \
-  -f restrictions=null
+  -F enforce_admins:=true \
+  -F required_pull_request_reviews.dismiss_stale_reviews:=true \
+  -F required_pull_request_reviews.require_code_owner_reviews:=$RCO \
+  -F required_pull_request_reviews.required_approving_review_count:=$APPROVALS \
+  -F restrictions:=null
 
 echo "Branch protection applied on $OWNER/$NAME:$DEF"
 
@@ -130,16 +140,16 @@ ts="$(date +%s)"
 if [ -n "$CODEOWNERS_CONTENT" ]; then
   B64=$(printf "%s" "$CODEOWNERS_CONTENT" | base64 -w0 2>/dev/null || printf "%s" "$CODEOWNERS_CONTENT" | base64)
   gh api -X PUT "repos/$OWNER/$NAME/contents/.github/CODEOWNERS" \
-    -f message="chore: add CODEOWNERS ($ts)" \
-    -f content="$B64" || echo "CODEOWNERS present or write-protected; skipping."
+    -F message="chore: add CODEOWNERS ($ts)" \
+    -F content="$B64" || echo "CODEOWNERS already present or write-protected; skipping."
 fi
 
 # Inject Snyk workflow (optional)
 if [ "$INJECT_SNYK" = "true" ]; then
   WF_B64=$(printf "%s" "$SNYK_WORKFLOW_YAML" | base64 -w0 2>/dev/null || printf "%s" "$SNYK_WORKFLOW_YAML" | base64)
   gh api -X PUT "repos/$OWNER/$NAME/contents/.github/workflows/snyk.yml" \
-    -f message="ci: add Snyk workflow ($ts)" \
-    -f content="$WF_B64" || echo "snyk.yml present or write-protected; skipping."
+    -F message="ci: add Snyk workflow ($ts)" \
+    -F content="$WF_B64" || echo "snyk.yml already present or write-protected; skipping."
 fi
 
 echo "Post-create steps completed for $OWNER/$NAME"
