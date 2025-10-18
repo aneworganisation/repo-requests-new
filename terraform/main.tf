@@ -15,26 +15,22 @@ locals {
     lower(r["name"]) => {
       name        = r["name"]
       description = try(r["description"], "")
-      visibility  = lower(try(r["visibility"], "public"))  # private|public|internal
+      visibility  = lower(try(r["visibility"], "private"))  # private|public|internal
     }
     if contains(keys(r), "name") && length(trimspace(try(r["name"], ""))) > 0
   }
 }
 
-# Create-only via GitHub CLI (no github_* resources, so no TF state tracking of repos)
 resource "null_resource" "create_repo" {
   for_each = local.repos
 
-  # Re-run when row values change
   triggers = {
     name        = each.value.name
     description = each.value.description
     visibility  = each.value.visibility
   }
 
-  ############################
-  # Step 1: Create repository
-  ############################
+  # STEP 1 — Create the repository (idempotent)
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {
@@ -46,23 +42,16 @@ resource "null_resource" "create_repo" {
     command = <<EOT
 set -euo pipefail
 
-# Normalize visibility (fix common typo: "pubic" -> "public")
+# Normalize visibility (fix common typo)
 VIS="$(echo "$RAW_VIS" | tr '[:upper:]' '[:lower:]' | sed -e 's/^pubic$/public/')"
-case "$VIS" in
-  private|public|internal) ;;
-  *) echo "Invalid visibility '$RAW_VIS' (normalized: '$VIS'). Use private|public|internal"; exit 1 ;;
-esac
+case "$VIS" in private|public|internal) ;; *) echo "Invalid visibility '$RAW_VIS'"; exit 1;; esac
 
-# Guard: OWNER must be a real org/user
+# Sanity checks
 if [ -z "$OWNER" ] || [ "$OWNER" = "your-org-login" ]; then
-  echo "ERROR: set github_owner (OWNER) to your real org/user. Current: '$OWNER'"
-  exit 1
+  echo "ERROR: set github_owner to your real org/user. Current: '$OWNER'"; exit 1
 fi
-
-# Ensure gh is authenticated (GH_TOKEN/GITHUB_TOKEN should be set in the job)
 if ! gh auth status >/dev/null 2>&1; then
-  echo "GitHub CLI not authenticated. Set GH_TOKEN (classic PAT with repo + admin:org if creating in org)."
-  exit 1
+  echo "GitHub CLI not authenticated. Set GH_TOKEN (classic PAT with repo + admin:org if org)."; exit 1
 fi
 
 # Create repo if missing
@@ -75,9 +64,7 @@ fi
 EOT
   }
 
-  ##########################################################################
-  # Step 2: Ensure default branch; apply branch protection; (optional) CODEOWNERS
-  ##########################################################################
+  # STEP 2 — Default branch + branch protection + optional CODEOWNERS (with early-exit)
   provisioner "local-exec" {
     when        = create
     interpreter = ["/bin/bash", "-c"]
@@ -87,14 +74,24 @@ EOT
       DEFAULT_BRANCH_FALLBACK = var.default_branch_fallback
       REQUIRED_APPROVALS      = tostring(var.required_approvals)
       REQUIRE_CODEOWNER       = tostring(var.require_codeowner_review)
-      REQUIRED_CONTEXTS_CSV   = join(",", var.required_contexts)  # comma-delimited for POSIX loop
+      REQUIRED_CONTEXTS_CSV   = join(",", var.required_contexts)   # comma-delimited
       CODEOWNERS_CONTENT      = var.codeowners_content
     }
     command = <<EOT
 set -euo pipefail
 
-# 2.1 Determine default branch via gh (gh has built-in --jq; no jq binary needed)
+# Resolve default branch (may be null for empty repos)
 DEF="$(gh repo view "$OWNER/$NAME" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
+
+# EARLY EXIT: if default branch exists AND protection is already present, skip this whole block
+if [ -n "$DEF" ] && [ "$DEF" != "null" ]; then
+  if gh api -X GET "repos/$OWNER/$NAME/branches/$DEF/protection" >/dev/null 2>&1; then
+    echo "Branch protection already present on $OWNER/$NAME:$DEF — skipping post-create actions."
+    exit 0
+  fi
+fi
+
+# If no default branch yet, initialize it with README and set as default
 if [ -z "$DEF" ] || [ "$DEF" = "null" ]; then
   DEF="$DEFAULT_BRANCH_FALLBACK"
   echo "No default branch detected. Initializing '$DEF' with README.md…"
@@ -105,33 +102,25 @@ if [ -z "$DEF" ] || [ "$DEF" = "null" ]; then
     -F branch="$DEF"
   gh api -X PATCH "repos/$OWNER/$NAME" -F default_branch="$DEF"
 else
-  echo "Default branch for $OWNER/$NAME is '$DEF'"
+  echo "Default branch for $OWNER/$NAME is '$DEF' (no protection yet)."
 fi
 
-# 2.2 Build JSON array of required contexts WITHOUT jq (allow empty -> [])
-# REQUIRED_CONTEXTS_CSV is a comma-separated list (possibly empty).
+# Build JSON array of required contexts WITHOUT jq (allow empty -> [])
 CTX_LIST=""
 if [ -n "$REQUIRED_CONTEXTS_CSV" ]; then
-  # Trim, split on comma, quote each, join with commas
   CTX_LIST=$(printf "%s" "$REQUIRED_CONTEXTS_CSV" | awk -F',' '{
-    n=0;
-    for(i=1;i<=NF;i++){
-      gsub(/^[ \t]+|[ \t]+$/, "", $i);
-      if($i!=""){ if(n++) printf(","); printf("\"%s\"",$i) }
-    }
+    n=0; for(i=1;i<=NF;i++){ gsub(/^[ \t]+|[ \t]+$/, "", $i); if($i!=""){ if(n++) printf(","); printf("\"%s\"",$i) } }
   }')
 fi
 [ -z "$CTX_LIST" ] && CTX_LIST=""
 
-# 2.3 Convert inputs to proper JSON types (POSIX-safe defaults)
+# Booleans/ints (POSIX-safe)
 RCO=false
 [ "$REQUIRE_CODEOWNER" = "true" ] && RCO=true
-
-APPROVALS="$REQUIRED_APPROVALS"
-if [ -z "$APPROVALS" ]; then APPROVALS=2; fi
+APPROVALS="$REQUIRED_APPROVALS"; if [ -z "$APPROVALS" ]; then APPROVALS=2; fi
 case "$APPROVALS" in ''|*[!0-9]*) APPROVALS=2 ;; esac
 
-# 2.4 Construct full JSON payload for branch protection (no jq)
+# Build full JSON payload (escape $ for Terraform so bash expands at runtime)
 PAYLOAD=$(cat <<JSON
 {
   "required_status_checks": {
@@ -158,7 +147,7 @@ gh api -X PUT "repos/$OWNER/$NAME/branches/$DEF/protection" \
 
 echo "Branch protection applied."
 
-# 2.5 (Optional) Inject CODEOWNERS if content provided (no jq)
+# Optional: inject CODEOWNERS if content provided
 if [ -n "$CODEOWNERS_CONTENT" ]; then
   ts="$(date +%s)"
   B64=$(printf "%s" "$CODEOWNERS_CONTENT" | base64 -w0 2>/dev/null || printf "%s" "$CODEOWNERS_CONTENT" | base64)
@@ -172,6 +161,5 @@ EOT
   }
 }
 
-# Useful outputs
 output "csv_used"               { value = local.csv_path }
 output "processed_repositories" { value = [for r in null_resource.create_repo : r.triggers.name] }
