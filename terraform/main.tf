@@ -136,13 +136,13 @@ PAYLOAD=$(cat <<JSON
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": [${CTX_LIST}]
+    "contexts": [$${CTX_LIST}]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": ${RCO},
-    "required_approving_review_count": ${APPROVALS}
+    "require_code_owner_reviews": $${RCO},
+    "required_approving_review_count": $${APPROVALS}
   },
   "restrictions": null
 }
