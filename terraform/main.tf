@@ -9,6 +9,7 @@ locals {
     }
   ]
 
+  # Map of repo requests keyed by normalized name
   repos = {
     for r in local.rows :
     lower(r["name"]) => {
@@ -20,17 +21,20 @@ locals {
   }
 }
 
-# Create-only via gh CLI (no GitHub resources tracked in TF state)
+# Create-only via GitHub CLI (no github_* resources, so no TF state tracking of repos)
 resource "null_resource" "create_repo" {
   for_each = local.repos
 
+  # Re-run when row values change
   triggers = {
     name        = each.value.name
     description = each.value.description
     visibility  = each.value.visibility
   }
 
-  # Step 1: Create the repo if missing
+  ############################
+  # Step 1: Create repository
+  ############################
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {
@@ -39,7 +43,7 @@ resource "null_resource" "create_repo" {
       RAW_VIS = each.value.visibility
       DESC    = each.value.description
     }
-    command = <<EOT
+    command = <<'EOT'
 set -euo pipefail
 
 # Normalize visibility (fix common typo: "pubic" -> "public")
@@ -55,9 +59,9 @@ if [ -z "$OWNER" ] || [ "$OWNER" = "your-org-login" ]; then
   exit 1
 fi
 
-# Ensure gh is authenticated
+# Ensure gh is authenticated (GH_TOKEN/GITHUB_TOKEN should be set in the job)
 if ! gh auth status >/dev/null 2>&1; then
-  echo "GitHub CLI not authenticated. Set GH_TOKEN/GITHUB_TOKEN (classic PAT with repo+admin:org)."
+  echo "GitHub CLI not authenticated. Set GH_TOKEN (classic PAT with repo + admin:org if creating in org)."
   exit 1
 fi
 
@@ -71,7 +75,9 @@ fi
 EOT
   }
 
-  # Step 2: Init default branch if needed, apply protection, inject files
+  ##########################################################################
+  # Step 2: Ensure default branch; apply branch protection; (optional) CODEOWNERS
+  ##########################################################################
   provisioner "local-exec" {
     when        = create
     interpreter = ["/bin/bash", "-c"]
@@ -80,14 +86,14 @@ EOT
       OWNER                   = var.github_owner
       DEFAULT_BRANCH_FALLBACK = var.default_branch_fallback
       REQUIRED_APPROVALS      = tostring(var.required_approvals)
-      REQUIRE_CODEOWNERS      = tostring(var.require_codeowner_review)
-      REQUIRED_CONTEXTS       = join(",", var.required_contexts) # comma-delimited for POSIX loop
+      REQUIRE_CODEOWNER       = tostring(var.require_codeowner_review)
+      REQUIRED_CONTEXTS_CSV   = join(",", var.required_contexts)  # comma-delimited for POSIX loop
       CODEOWNERS_CONTENT      = var.codeowners_content
     }
-    command = <<EOT
+    command = <<'EOT'
 set -euo pipefail
 
-# Determine default branch; initialize if empty repo
+# 2.1 Determine default branch; initialize if repo is empty
 DEF="$(gh repo view "$OWNER/$NAME" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
 if [ -z "$DEF" ] || [ "$DEF" = "null" ]; then
   DEF="$DEFAULT_BRANCH_FALLBACK"
@@ -102,54 +108,59 @@ else
   echo "Default branch for $OWNER/$NAME is '$DEF'"
 fi
 
-# Build -F args for required status checks (POSIX-friendly; no arrays)
-CTX_ARGS=""
-OLDIFS="$IFS"; IFS=','
-for c in $REQUIRED_CONTEXTS; do
-  c="$(echo "$c" | xargs)"   # trim spaces
-  [ -n "$c" ] && CTX_ARGS="$CTX_ARGS -F required_status_checks.contexts[]=$c"
-done
-IFS="$OLDIFS"
+# 2.2 Build required status checks array from comma list (allow empty -> [])
+CTX_JSON=$(printf "%s" "$REQUIRED_CONTEXTS_CSV" | jq -R '
+  split(",")
+  | map(gsub("^\\s+|\\s+$";""))
+  | map(select(length>0))
+')
 
-# Convert inputs to proper JSON literals ( POSIX-safe)
+# 2.3 Convert inputs to proper JSON types (POSIX-safe defaults)
 RCO=false
-[ "$REQUIRE_CODEOWNERS" = "true" ] && RCO=true
+[ "$REQUIRE_CODEOWNER" = "true" ] && RCO=true
 
 APPROVALS="$REQUIRED_APPROVALS"
-if [ -z "$APPROVALS" ]; then
-  APPROVALS=2
-fi
+if [ -z "$APPROVALS" ]; then APPPROVALS=2; fi
 case "$APPROVALS" in ''|*[!0-9]*) APPROVALS=2 ;; esac
 
-# Apply branch protection (use := for booleans/ints/null so JSON types are correct)
-# shellcheck disable=SC2086
+# 2.4 Construct full JSON payload for branch protection
+PAYLOAD=$(jq -n \
+  --argjson contexts "$CTX_JSON" \
+  --argjson strict true \
+  --argjson admins true \
+  --argjson dismiss true \
+  --argjson codeowners "$RCO" \
+  --argjson approvals "$APPROVALS" \
+  '{
+     required_status_checks: {
+       strict: $strict,
+       contexts: $contexts
+     },
+     enforce_admins: $admins,
+     required_pull_request_reviews: {
+       dismiss_stale_reviews: $dismiss,
+       require_code_owner_reviews: $codeowners,
+       required_approving_review_count: $approvals
+     },
+     restrictions: null
+   }')
+
+echo "Applying branch protection on $OWNER/$NAME:$DEF with payload:"
+echo "$PAYLOAD" | jq .
+
 gh api -X PUT "repos/$OWNER/$NAME/branches/$DEF/protection" \
-  -F required_status_checks.strict:=true \
-  $CTX_ARGS \
-  -F enforce_admins:=true \
-  -F required_pull_request_reviews.dismiss_stale_reviews:=true \
-  -F required_pull_request_reviews.require_code_owner_reviews:=$RCO \
-  -F required_pull_request_reviews.required_approving_review_count:=$APPROVALS \
-  -F restrictions:=null
+  -H "Accept: application/vnd.github+json" \
+  --input - <<< "$PAYLOAD"
 
-echo "Branch protection applied on $OWNER/$NAME:$DEF"
+echo "Branch protection applied."
 
-ts="$(date +%s)"
-
-# Inject CODEOWNERS if content provided
+# 2.5 (Optional) Inject CODEOWNERS if content provided
 if [ -n "$CODEOWNERS_CONTENT" ]; then
+  ts="$(date +%s)"
   B64=$(printf "%s" "$CODEOWNERS_CONTENT" | base64 -w0 2>/dev/null || printf "%s" "$CODEOWNERS_CONTENT" | base64)
   gh api -X PUT "repos/$OWNER/$NAME/contents/.github/CODEOWNERS" \
     -F message="chore: add CODEOWNERS ($ts)" \
     -F content="$B64" || echo "CODEOWNERS already present or write-protected; skipping."
-fi
-
-# Inject Snyk workflow (optional)
-if [ "$INJECT_SNYK" = "true" ]; then
-  WF_B64=$(printf "%s" "$SNYK_WORKFLOW_YAML" | base64 -w0 2>/dev/null || printf "%s" "$SNYK_WORKFLOW_YAML" | base64)
-  gh api -X PUT "repos/$OWNER/$NAME/contents/.github/workflows/snyk.yml" \
-    -F message="ci: add Snyk workflow ($ts)" \
-    -F content="$WF_B64" || echo "snyk.yml already present or write-protected; skipping."
 fi
 
 echo "Post-create steps completed for $OWNER/$NAME"
@@ -157,11 +168,6 @@ EOT
   }
 }
 
-# Helpful outputs
-output "csv_used" {
-  value = local.csv_path
-}
-
-output "processed_repositories" {
-  value = [for r in null_resource.create_repo : r.triggers.name]
-}
+# Useful outputs
+output "csv_used"               { value = local.csv_path }
+output "processed_repositories" { value = [for r in null_resource.create_repo : r.triggers.name] }
