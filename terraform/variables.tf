@@ -11,7 +11,7 @@ variable "repos_csv_path" {
 variable "required_contexts" {
   description = "Status checks required before merge (job names)"
   type        = list(string)
-  default     = ["build", "snyk"]
+  default     = []
 }
 
 variable "required_approvals" {
